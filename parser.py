@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -183,12 +184,51 @@ def _angle_fingerprint(url: str) -> str:
     return path
 
 
-def _media_full_urls(product: dict[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
-    """Return (ordered full-size URLs deduped by angle, media objects with url+label)."""
+def _src_url(raw: Any) -> str:
+    """Normalize a raw media source (string or {url/src}) into an absolute URL."""
+    if not raw:
+        return ""
+    if isinstance(raw, dict):
+        raw = raw.get("url") or raw.get("src") or raw.get("source") or ""
+    return _normalize_url(str(raw))
+
+
+def _first_url(candidates: Any) -> str:
+    """Return the first usable URL from a list-or-scalar source, normalized."""
+    if isinstance(candidates, list):
+        for candidate in candidates or []:
+            url = _src_url(candidate)
+            if url:
+                return url
+        return ""
+    return _src_url(candidates)
+
+
+def _iter_urls(raw: Any):
+    """Yield normalized URLs from a scalar or a list of scalars/dicts."""
+    if isinstance(raw, list):
+        for item in raw:
+            url = _src_url(item)
+            if url:
+                yield url
+    else:
+        url = _src_url(raw)
+        if url:
+            yield url
+
+
+def _media_full_urls(product: dict[str, Any]) -> tuple[list[str], list[dict[str, str]], str]:
+    """Return (full-size URLs deduped by angle, media objects with url+label, compressed URL).
+
+    Sources are tried in priority order: media.full, media.standard (only when
+    full is empty), mediaObjects sources (full/standard/thumb), then
+    seo.image / structuredData.image. Only empty when a product truly has no
+    image anywhere.
+    """
     full_urls: list[str] = []
     objects: list[dict[str, str]] = []
     seen_angles: set[str] = set()
-    media_standard: list[str] = []
+    compressed_url = ""
 
     def _add(url: str, label: str = "") -> None:
         if not url:
@@ -200,26 +240,18 @@ def _media_full_urls(product: dict[str, Any]) -> tuple[list[str], list[dict[str,
         full_urls.append(url)
         objects.append({"full": url, "alt": label})
 
-    def _first_url(candidates: Any) -> str:
-        if isinstance(candidates, list) and candidates:
-            first = candidates[0]
-            if isinstance(first, dict):
-                return _normalize_url(str(first.get("url") or ""))
-            if isinstance(first, str):
-                return _normalize_url(first)
-        return ""
-
     media_raw = product.get("media") or {}
     if isinstance(media_raw, dict):
-        for source in media_raw.get("full") or []:
-            _add(_normalize_url(str(source)))
-        media_standard = [
-            _normalize_url(str(s)) for s in (media_raw.get("standard") or [])
-            if s
-        ]
+        full_sources = [s for s in (media_raw.get("full") or []) if s]
+        standard_sources = [s for s in (media_raw.get("standard") or []) if s]
+        if standard_sources:
+            compressed_url = _src_url(standard_sources[0])
+        chain = full_sources or standard_sources
+        for source in chain:
+            _add(_src_url(source))
     elif isinstance(media_raw, list):
         for source in media_raw:
-            _add(_normalize_url(str(source)))
+            _add(_src_url(source))
 
     for obj in product.get("mediaObjects") or []:
         if not isinstance(obj, dict):
@@ -231,12 +263,30 @@ def _media_full_urls(product: dict[str, Any]) -> tuple[list[str], list[dict[str,
                 label = str(val)
                 break
         sources = obj.get("sources") or {}
-        full_url = _first_url(sources.get("full"))
-        if not full_url:
-            full_url = _first_url(sources.get("standard"))
-        _add(full_url, label)
+        obj_url = ""
+        if isinstance(sources, dict):
+            for key in ("full", "standard", "thumb"):
+                obj_url = _first_url(sources.get(key))
+                if obj_url:
+                    break
+        elif isinstance(sources, list):
+            obj_url = _first_url(sources)
+        if not obj_url:
+            obj_url = _src_url(obj)
+        _add(obj_url, label)
 
-    return full_urls, objects, media_standard[0] if media_standard else ""
+    if not full_urls:
+        for section in ("seo", "structuredData"):
+            holder = product.get(section) or {}
+            if not isinstance(holder, dict):
+                continue
+            for key in ("image", "imageUrl", "images"):
+                for url in _iter_urls(holder.get(key)):
+                    _add(url)
+            if full_urls:
+                break
+
+    return full_urls, objects, compressed_url
 
 
 def _detect_back_image(objects: list[dict[str, str]], front_src: str) -> Optional[str]:
@@ -486,7 +536,11 @@ def scrape_all_products(urls: list[str] | None = None) -> list[dict[str, Any]]:
         time.sleep(cfg.RATE_LIMIT_DELAY)
     logger.info("Scraped %d products, %d URLs failed to parse", len(products), len(failed))
     if failed:
-        with open("logs/missed_urls.log", "a") as f:
-            for u in failed:
-                f.write(f"{u}\n")
+        try:
+            Path("logs").mkdir(parents=True, exist_ok=True)
+            with open("logs/missed_urls.log", "a") as f:
+                for u in failed:
+                    f.write(f"{u}\n")
+        except Exception as e:
+            logger.error("Failed to write missed URLs log: %s", e)
     return products

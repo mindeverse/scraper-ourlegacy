@@ -108,6 +108,7 @@ def _embed_diff_stats() -> dict[str, int]:
 
 def run() -> dict[str, Any]:
     logger.info("=== Our Legacy scraper start ===")
+    Path("logs").mkdir(parents=True, exist_ok=True)
     if not cfg.SUPABASE_URL or not cfg.SUPABASE_KEY:
         logger.error("SUPABASE_URL / SUPABASE_KEY env vars missing")
         sys.exit(1)
@@ -191,8 +192,13 @@ def run() -> dict[str, Any]:
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    Path("logs").mkdir(exist_ok=True)
-    Path("logs/last_run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    try:
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        Path("logs/last_run_summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.error("Failed to write run summary: %s", e)
 
     logger.info("=== Run summary ===")
     for k, v in summary.items():
